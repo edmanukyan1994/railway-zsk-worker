@@ -23,6 +23,8 @@ client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
 
 # ── HELPERS ───────────────────────────────────────────────────────────────────
 async def send_bot_message(chat_id: int, text: str):
+    if not chat_id:
+        return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with aiohttp.ClientSession() as s:
         await s.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
@@ -33,6 +35,13 @@ def cache_get(inn: str):
 
 def cache_set(inn: str, data: dict):
     redis.setex(f"{CACHE_KEY}:{inn}", CACHE_TTL, json.dumps(data))
+
+def latest_set(inn: str, data: dict):
+    # постоянное хранилище для сайта
+    payload = dict(data)
+    payload["updated_at"] = int(time.time())
+    # сохраняем как HASH для выборочного чтения
+    redis.hset(f"zsk:latest:{inn}", mapping={k: ("" if v is None else v) for k, v in payload.items()})
 
 # ── ПАРСЕР ────────────────────────────────────────────────────────────────────
 RISK_MAP = {
@@ -114,18 +123,18 @@ async def ask_zsk(inn: str) -> str:
     await client.send_message(ZSK_BOT, inn)
     collected, started, last_len = [], time.time(), 0
     idle_window = 5
+    idle_start = time.time()
 
     @client.on(events.NewMessage(from_users=ZSK_BOT))
     async def on_msg(ev):
+        nonlocal collected, idle_start
         txt = ev.raw_text or ""
         collected.append(txt)
+        idle_start = time.time()
 
     while time.time() - started < RESPONSE_TIMEOUT:
         await asyncio.sleep(1)
-        if len(collected) != last_len:
-            last_len = len(collected)
-            idle_start = time.time()
-        elif time.time() - idle_start > idle_window and collected:
+        if collected and (time.time() - idle_start > idle_window):
             break
 
     try:
@@ -155,22 +164,33 @@ async def run():
             continue
 
         inn = job.get("inn")
-        chat_id = job.get("chat_id")
-        if not inn or not chat_id:
+        chat_id = job.get("chat_id")  # может отсутствовать (задание с сайта/крона)
+        if not inn:
             continue
 
+        # если уже есть кэш — сразу отвечаем (и обновляем latest для сайта)
         cached = cache_get(inn)
         if cached:
-            await send_bot_message(chat_id, f"ИНН: {inn}\nРезультат (кэш 24ч): {cached['risk']}\n\n{cached.get('risk_reason','') or cached.get('raw','')[:1200]}")
+            latest_set(inn, cached)
+            await send_bot_message(
+                chat_id,
+                f"ИНН: {inn}\nРезультат (кэш 24ч): {cached.get('risk_ru') or cached['risk']}\n"
+                f"Код риска: {cached.get('risk_code') or '-'}\n"
+                f"Причина: {cached.get('risk_reason') or '-'}\n"
+                f"Добавлен: {cached.get('added_at') or '-'}"
+            )
             continue
 
         try:
             raw = await ask_zsk(inn)
             parsed = parse_answer(raw)
-            cache_set(inn, parsed)
+            effective_inn = parsed.get("inn") or inn  # если бот вернул ИНН в тексте
+            cache_set(effective_inn, parsed)
+            latest_set(effective_inn, parsed)
+
             await send_bot_message(
                 chat_id,
-                f"ИНН: {inn}\nРезультат: {parsed['risk_ru'] or parsed['risk']}\n"
+                f"ИНН: {effective_inn}\nРезультат: {parsed.get('risk_ru') or parsed['risk']}\n"
                 f"Код риска: {parsed.get('risk_code') or '-'}\n"
                 f"Причина: {parsed.get('risk_reason') or '-'}\n"
                 f"Добавлен: {parsed.get('added_at') or '-'}"
