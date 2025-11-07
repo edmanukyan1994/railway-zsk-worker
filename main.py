@@ -42,12 +42,7 @@ def latest_set(inn: str, data: dict):
     redis.hset(f"zsk:latest:{inn}", mapping={k: ("" if v is None else v) for k, v in payload.items()})
 
 # ── ПАРСЕР ────────────────────────────────────────────────────────────────────
-RISK_MAP = {
-    'высок': 'high',
-    'средн': 'medium',
-    'низк':  'low',
-    'отсут': 'none'
-}
+RISK_MAP = {'высок': 'high', 'средн': 'medium', 'низк': 'low', 'отсут': 'none'}
 
 def parse_answer(raw: str) -> dict:
     text = re.sub(r'\s+', ' ', raw or '').strip()
@@ -98,10 +93,9 @@ def parse_answer(raw: str) -> dict:
     }
 
 # ── ВЗАИМОДЕЙСТВИЕ С ZSK-БОТОМ ───────────────────────────────────────────────
-LAST_START_AT = 0  # для анти-спама /start
+LAST_START_AT = 0  # анти-спам /start (не чаще 1 раза в 20 минут)
 
 async def ensure_started():
-    """Отправляем /start не чаще, чем раз в 20 минут."""
     global LAST_START_AT
     now = time.time()
     if now - LAST_START_AT > 20 * 60:
@@ -114,7 +108,7 @@ async def ensure_started():
             print(f"⚠️  /start error: {e}")
 
 async def ask_zsk(inn: str) -> str:
-    # сюда приходим ТОЛЬКО с валидным ИНН
+    # сюда попадаем ТОЛЬКО с валидным inn
     await ensure_started()
 
     await client.send_message(ZSK_BOT, inn)
@@ -143,15 +137,29 @@ async def ask_zsk(inn: str) -> str:
         raise TimeoutError("Нет ответа от @zskbenefitsarbot")
     return "\n\n".join(collected)
 
+# ── ОЧЕРЕДЬ ───────────────────────────────────────────────────────────────────
 def queue_pop_blocking(timeout=5):
+    """
+    Возвращает dict как минимум с ключом 'inn'.
+    Устойчиво парсит payload: JSON/число/строка.
+    """
     item = redis.blpop(QUEUE_KEY, timeout=timeout)
     if not item:
         return None
-    _, payload = item
+    _, payload = item  # str
+
+    # 1) JSON {"inn":"..." } или {"inn":123}
     try:
-        return json.loads(payload)
+        obj = json.loads(payload)
+        if isinstance(obj, dict) and "inn" in obj:
+            obj["inn"] = str(obj["inn"])
+            return obj
     except Exception:
-        return None
+        pass
+
+    # 2) plain value → считаем это ИНН
+    plain = str(payload).strip()
+    return {"inn": plain} if plain else None
 
 # ── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 async def run():
@@ -163,10 +171,12 @@ async def run():
         if not job:
             continue
 
-        inn = (job.get("inn") or "").strip()
-        chat_id = job.get("chat_id")  # может отсутствовать
+        # приведение к строке и оставляем только цифры
+        raw_inn = str(job.get("inn") or "")
+        inn = re.sub(r"\D", "", raw_inn)
+        chat_id = job.get("chat_id")
 
-        # ✅ валидируем ИНН. если не валиден — пропускаем без /start
+        # валидация ИНН: 10–12 цифр. если не валиден — пропускаем без /start
         if not re.fullmatch(r"\d{10,12}", inn):
             print(f"⚠️  skip job без валидного inn: {job}")
             continue
