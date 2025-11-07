@@ -1,17 +1,22 @@
-# Dockerfile
-FROM python:3.13-slim
+# --- Dockerfile (в корне репо) ---
+FROM python:3.12-slim
+
+WORKDIR /app
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /app
+# базовые утилиты и сертификаты
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ca-certificates curl \
+ && rm -rf /var/lib/apt/lists/*
 
-# Если есть requirements.txt — ставим зависимости
-COPY requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt || true
+# зависимости Python
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
 
-# Кладём весь код
-COPY . /app
+# код приложения
+COPY . .
 
-# Стартуем воркер
+# запуск воркера
 CMD ["python", "main.py"]
