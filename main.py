@@ -37,10 +37,8 @@ def cache_set(inn: str, data: dict):
     redis.setex(f"{CACHE_KEY}:{inn}", CACHE_TTL, json.dumps(data))
 
 def latest_set(inn: str, data: dict):
-    # постоянное хранилище для сайта
     payload = dict(data)
     payload["updated_at"] = int(time.time())
-    # сохраняем как HASH для выборочного чтения
     redis.hset(f"zsk:latest:{inn}", mapping={k: ("" if v is None else v) for k, v in payload.items()})
 
 # ── ПАРСЕР ────────────────────────────────────────────────────────────────────
@@ -52,25 +50,14 @@ RISK_MAP = {
 }
 
 def parse_answer(raw: str) -> dict:
-    """
-    Парсит ответ @zskbenefitsarbot даже если вокруг есть промо-текст.
-    Извлекает:
-      - subject (ООО/ИП ...), inn
-      - risk ('high'|'medium'|'low'|'none'|'unknown) + risk_ru
-      - risk_code (напр. '1.02') и risk_reason (краткое описание)
-      - added_at (ISO, если найдена дата 'Добавлен: ДД.ММ.ГГГГ')
-      - raw (очищенный сплошной текст)
-    """
     text = re.sub(r'\s+', ' ', raw or '').strip()
 
     subj, inn, risk_ru = None, None, None
-    # 1) ИНН и субъект
     m = re.search(r'(ООО|АО|ПАО|ИП)\s+([^|]+?)\s*\|\s*(\d{10,12})', text, re.I)
     if m:
         subj = (m.group(1) + ' ' + m.group(2)).strip()
         inn  = m.group(3)
 
-    # 2) Уровень риска
     m = re.search(r'Текущий\s+уровень\s+риска\s+ЗСК:?\s*(?:[^\w]|)+\s*(Высокий|Средний|Низкий|Отсутствует)', text, re.I)
     if not m:
         m = re.search(r'Уровень\s+риска:?\s*(?:[^\w]|)+\s*(Высокий|Средний|Низкий|Отсутствует)', text, re.I)
@@ -85,14 +72,12 @@ def parse_answer(raw: str) -> dict:
                 risk = v
                 break
 
-    # 3) Основной риск
     risk_code, risk_reason = None, None
     m = re.search(r'Основной\s+риск:\s*([0-9]{1,2}\.[0-9]{2})\s+(.+?)(?:[\.\!]|$)', text, re.I)
     if m:
         risk_code = m.group(1)
         risk_reason = m.group(2).strip()
 
-    # 4) Дата "Добавлен"
     added_at_iso = None
     m = re.search(r'Добавлен:\s*(\d{2}\.\d{2}\.\d{4})', text)
     if m:
@@ -113,15 +98,27 @@ def parse_answer(raw: str) -> dict:
     }
 
 # ── ВЗАИМОДЕЙСТВИЕ С ZSK-БОТОМ ───────────────────────────────────────────────
+LAST_START_AT = 0  # для анти-спама /start
+
+async def ensure_started():
+    """Отправляем /start не чаще, чем раз в 20 минут."""
+    global LAST_START_AT
+    now = time.time()
+    if now - LAST_START_AT > 20 * 60:
+        try:
+            await client.send_message(ZSK_BOT, "/start")
+            LAST_START_AT = now
+            await asyncio.sleep(1)
+            print("↪️  sent /start")
+        except Exception as e:
+            print(f"⚠️  /start error: {e}")
+
 async def ask_zsk(inn: str) -> str:
-    try:
-        await client.send_message(ZSK_BOT, "/start")
-        await asyncio.sleep(1)
-    except:
-        pass
+    # сюда приходим ТОЛЬКО с валидным ИНН
+    await ensure_started()
 
     await client.send_message(ZSK_BOT, inn)
-    collected, started, last_len = [], time.time(), 0
+    collected, started = [], time.time()
     idle_window = 5
     idle_start = time.time()
 
@@ -151,7 +148,10 @@ def queue_pop_blocking(timeout=5):
     if not item:
         return None
     _, payload = item
-    return json.loads(payload)
+    try:
+        return json.loads(payload)
+    except Exception:
+        return None
 
 # ── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 async def run():
@@ -163,12 +163,17 @@ async def run():
         if not job:
             continue
 
-        inn = job.get("inn")
-        chat_id = job.get("chat_id")  # может отсутствовать (задание с сайта/крона)
-        if not inn:
+        inn = (job.get("inn") or "").strip()
+        chat_id = job.get("chat_id")  # может отсутствовать
+
+        # ✅ валидируем ИНН. если не валиден — пропускаем без /start
+        if not re.fullmatch(r"\d{10,12}", inn):
+            print(f"⚠️  skip job без валидного inn: {job}")
             continue
 
-        # если уже есть кэш — сразу отвечаем (и обновляем latest для сайта)
+        print(f"▶️ JOB: {inn}")
+
+        # кэш → сразу ответ + обновление latest
         cached = cache_get(inn)
         if cached:
             latest_set(inn, cached)
@@ -179,12 +184,13 @@ async def run():
                 f"Причина: {cached.get('risk_reason') or '-'}\n"
                 f"Добавлен: {cached.get('added_at') or '-'}"
             )
+            print(f"💾 cache hit: {inn} -> {cached.get('risk')}")
             continue
 
         try:
             raw = await ask_zsk(inn)
             parsed = parse_answer(raw)
-            effective_inn = parsed.get("inn") or inn  # если бот вернул ИНН в тексте
+            effective_inn = (parsed.get("inn") or inn).strip()
             cache_set(effective_inn, parsed)
             latest_set(effective_inn, parsed)
 
@@ -195,11 +201,14 @@ async def run():
                 f"Причина: {parsed.get('risk_reason') or '-'}\n"
                 f"Добавлен: {parsed.get('added_at') or '-'}"
             )
+            print(f"✅ done: {effective_inn} -> {parsed.get('risk')} ({parsed.get('risk_code') or '-'})")
         except FloodWaitError as fw:
             await send_bot_message(chat_id, f"Telegram ограничил частоту. Подождите {fw.seconds} сек…")
+            print(f"⏳ FloodWait {fw.seconds}s on {inn}")
             await asyncio.sleep(fw.seconds + 3)
         except Exception as e:
             await send_bot_message(chat_id, f"Ошибка запроса к @{ZSK_BOT}: {e}")
+            print(f"❌ error on {inn}: {e}")
 
 if __name__ == "__main__":
     asyncio.run(run())
