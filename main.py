@@ -18,6 +18,21 @@ CACHE_TTL   = int(os.getenv("CACHE_TTL", "86400"))  # 24 часа
 ZSK_BOT     = os.getenv("ZSK_BOT", "zskbenefitsarbot")
 RESPONSE_TIMEOUT = int(os.getenv("RESPONSE_TIMEOUT", "60"))
 
+# логирование: по умолчанию тихо (чтобы не ловить лимит Railway)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()  # INFO | DEBUG | QUIET
+
+def log_info(msg: str):
+    if LOG_LEVEL in ("INFO", "DEBUG"):
+        print(msg, flush=True)
+
+def log_debug(msg: str):
+    if LOG_LEVEL == "DEBUG":
+        print(msg, flush=True)
+
+def log_quiet(msg: str):
+    # никогда не печатаем
+    pass
+
 redis = Redis.from_url(REDIS_URL, decode_responses=True)
 client = TelegramClient(StringSession(TG_SESSION), TG_API_ID, TG_API_HASH)
 
@@ -27,19 +42,26 @@ async def send_bot_message(chat_id: int, text: str):
         return
     url = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
     async with aiohttp.ClientSession() as s:
-        await s.post(url, json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True})
+        await s.post(
+            url,
+            json={"chat_id": chat_id, "text": text, "disable_web_page_preview": True},
+            timeout=aiohttp.ClientTimeout(total=20)
+        )
 
 def cache_get(inn: str):
     val = redis.get(f"{CACHE_KEY}:{inn}")
     return json.loads(val) if val else None
 
 def cache_set(inn: str, data: dict):
-    redis.setex(f"{CACHE_KEY}:{inn}", CACHE_TTL, json.dumps(data))
+    redis.setex(f"{CACHE_KEY}:{inn}", CACHE_TTL, json.dumps(data, ensure_ascii=False))
 
 def latest_set(inn: str, data: dict):
     payload = dict(data)
     payload["updated_at"] = int(time.time())
-    redis.hset(f"zsk:latest:{inn}", mapping={k: ("" if v is None else v) for k, v in payload.items()})
+    redis.hset(
+        f"zsk:latest:{inn}",
+        mapping={k: ("" if v is None else str(v)) for k, v in payload.items()}
+    )
 
 # ── ПАРСЕР ────────────────────────────────────────────────────────────────────
 RISK_MAP = {'высок': 'high', 'средн': 'medium', 'низк': 'low', 'отсут': 'none'}
@@ -103,15 +125,14 @@ async def ensure_started():
             await client.send_message(ZSK_BOT, "/start")
             LAST_START_AT = now
             await asyncio.sleep(1)
-            print("↪️  sent /start")
+            log_debug("↪️ sent /start")
         except Exception as e:
-            print(f"⚠️  /start error: {e}")
+            log_info(f"⚠️ /start error: {e}")
 
 async def ask_zsk(inn: str) -> str:
-    # сюда попадаем ТОЛЬКО с валидным inn
     await ensure_started()
-
     await client.send_message(ZSK_BOT, inn)
+
     collected, started = [], time.time()
     idle_window = 5
     idle_start = time.time()
@@ -119,8 +140,7 @@ async def ask_zsk(inn: str) -> str:
     @client.on(events.NewMessage(from_users=ZSK_BOT))
     async def on_msg(ev):
         nonlocal collected, idle_start
-        txt = ev.raw_text or ""
-        collected.append(txt)
+        collected.append(ev.raw_text or "")
         idle_start = time.time()
 
     while time.time() - started < RESPONSE_TIMEOUT:
@@ -135,90 +155,109 @@ async def ask_zsk(inn: str) -> str:
 
     if not collected:
         raise TimeoutError("Нет ответа от @zskbenefitsarbot")
+
     return "\n\n".join(collected)
 
 # ── ОЧЕРЕДЬ ───────────────────────────────────────────────────────────────────
 def queue_pop_blocking(timeout=5):
     """
-    Возвращает dict как минимум с ключом 'inn'.
-    Устойчиво парсит payload: JSON/число/строка.
+    Возвращает dict минимум с ключом 'inn'.
+    Поддерживает:
+      - JSON dict: {"inn":"...","chat_id":0,"force":1}
+      - plain: "7729..."
+      - JSON number: 7729...
     """
     item = redis.blpop(QUEUE_KEY, timeout=timeout)
     if not item:
         return None
     _, payload = item  # str
 
-    # 1) JSON {"inn":"..." } или {"inn":123}
+    # пробуем JSON
     try:
         obj = json.loads(payload)
-        if isinstance(obj, dict) and "inn" in obj:
-            obj["inn"] = str(obj["inn"])
+        if isinstance(obj, dict):
+            if "inn" in obj:
+                obj["inn"] = str(obj["inn"])
             return obj
+        if isinstance(obj, (int, float, str)):
+            plain = str(obj).strip()
+            return {"inn": plain} if plain else None
     except Exception:
         pass
 
-    # 2) plain value → считаем это ИНН
+    # plain string
     plain = str(payload).strip()
     return {"inn": plain} if plain else None
 
 # ── ГЛАВНЫЙ ЦИКЛ ─────────────────────────────────────────────────────────────
 async def run():
     await client.start()
-    print("Worker connected. Listening queue…")
+    log_info("Worker connected. Listening queue…")
 
     while True:
         job = queue_pop_blocking(timeout=5)
         if not job:
             continue
 
-        # приведение к строке и оставляем только цифры
         raw_inn = str(job.get("inn") or "")
         inn = re.sub(r"\D", "", raw_inn)
         chat_id = job.get("chat_id")
+        force = bool(job.get("force"))  # <-- ВАЖНО
 
-        # валидация ИНН: 10–12 цифр. если не валиден — пропускаем без /start
+        # валидация ИНН: 10–12 цифр
         if not re.fullmatch(r"\d{10,12}", inn):
-            print(f"⚠️  skip job без валидного inn: {job}")
+            log_info(f"⚠️ skip job без валидного inn: {job}")
             continue
 
-        print(f"▶️ JOB: {inn}")
+        log_debug(f"▶️ JOB: {inn} (force={int(force)})")
 
-        # кэш → сразу ответ + обновление latest
-        cached = cache_get(inn)
-        if cached:
-            latest_set(inn, cached)
-            await send_bot_message(
-                chat_id,
-                f"ИНН: {inn}\nРезультат (кэш 24ч): {cached.get('risk_ru') or cached['risk']}\n"
-                f"Код риска: {cached.get('risk_code') or '-'}\n"
-                f"Причина: {cached.get('risk_reason') or '-'}\n"
-                f"Добавлен: {cached.get('added_at') or '-'}"
-            )
-            print(f"💾 cache hit: {inn} -> {cached.get('risk')}")
-            continue
+        # кэш используем только если НЕ force
+        if not force:
+            cached = cache_get(inn)
+            if cached:
+                latest_set(inn, cached)
+                # тихий режим: не шлем сообщение в телеграм, если chat_id=0
+                log_debug(f"💾 cache hit: {inn} -> {cached.get('risk')}")
+                if chat_id:
+                    await send_bot_message(
+                        chat_id,
+                        f"ИНН: {inn}\nРезультат (кэш 24ч): {cached.get('risk_ru') or cached['risk']}\n"
+                        f"Код риска: {cached.get('risk_code') or '-'}\n"
+                        f"Причина: {cached.get('risk_reason') or '-'}\n"
+                        f"Добавлен: {cached.get('added_at') or '-'}"
+                    )
+                continue
 
+        # force=1 ИЛИ кэша нет → делаем реальный запрос боту
         try:
             raw = await ask_zsk(inn)
             parsed = parse_answer(raw)
-            effective_inn = (parsed.get("inn") or inn).strip()
+            effective_inn = re.sub(r"\D", "", (parsed.get("inn") or inn).strip()) or inn
+
             cache_set(effective_inn, parsed)
             latest_set(effective_inn, parsed)
 
-            await send_bot_message(
-                chat_id,
-                f"ИНН: {effective_inn}\nРезультат: {parsed.get('risk_ru') or parsed['risk']}\n"
-                f"Код риска: {parsed.get('risk_code') or '-'}\n"
-                f"Причина: {parsed.get('risk_reason') or '-'}\n"
-                f"Добавлен: {parsed.get('added_at') or '-'}"
-            )
-            print(f"✅ done: {effective_inn} -> {parsed.get('risk')} ({parsed.get('risk_code') or '-'})")
+            log_info(f"✅ done: {effective_inn} -> {parsed.get('risk')} ({parsed.get('risk_code') or '-'})")
+
+            if chat_id:
+                await send_bot_message(
+                    chat_id,
+                    f"ИНН: {effective_inn}\nРезультат: {parsed.get('risk_ru') or parsed['risk']}\n"
+                    f"Код риска: {parsed.get('risk_code') or '-'}\n"
+                    f"Причина: {parsed.get('risk_reason') or '-'}\n"
+                    f"Добавлен: {parsed.get('added_at') or '-'}"
+                )
+
         except FloodWaitError as fw:
-            await send_bot_message(chat_id, f"Telegram ограничил частоту. Подождите {fw.seconds} сек…")
-            print(f"⏳ FloodWait {fw.seconds}s on {inn}")
+            log_info(f"⏳ FloodWait {fw.seconds}s on {inn}")
+            if chat_id:
+                await send_bot_message(chat_id, f"Telegram ограничил частоту. Подождите {fw.seconds} сек…")
             await asyncio.sleep(fw.seconds + 3)
+
         except Exception as e:
-            await send_bot_message(chat_id, f"Ошибка запроса к @{ZSK_BOT}: {e}")
-            print(f"❌ error on {inn}: {e}")
+            log_info(f"❌ error on {inn}: {e}")
+            if chat_id:
+                await send_bot_message(chat_id, f"Ошибка запроса к @{ZSK_BOT}: {e}")
 
 if __name__ == "__main__":
     asyncio.run(run())
